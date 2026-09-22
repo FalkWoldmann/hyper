@@ -1,14 +1,16 @@
-use std::task::{Context, Poll};
 #[cfg(feature = "http2")]
-use std::{future::Future, pin::Pin};
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
+use futures_channel::{mpsc, oneshot};
+use futures_core::Stream;
 #[cfg(feature = "http2")]
 use http::{Request, Response};
 #[cfg(feature = "http2")]
 use http_body::Body;
 #[cfg(feature = "http2")]
 use pin_project_lite::pin_project;
-use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "http2")]
 use crate::{body::Incoming, proto::h2::client::ResponseFutMap};
@@ -29,7 +31,7 @@ pub struct TrySendError<T> {
 }
 
 pub(crate) fn channel<T, U>() -> (Sender<T, U>, Receiver<T, U>) {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::unbounded();
     let (giver, taker) = want::new();
     let tx = Sender {
         #[cfg(feature = "http1")]
@@ -110,9 +112,9 @@ impl<T, U> Sender<T, U> {
         }
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::Retry(Some(tx))))))
+            .unbounded_send(Envelope(Some((val, Callback::Retry(Some(tx))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|e| e.into_inner().0.take().expect("envelope not dropped").0)
     }
 
     #[cfg(feature = "http1")]
@@ -122,9 +124,9 @@ impl<T, U> Sender<T, U> {
         }
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
+            .unbounded_send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|e| e.into_inner().0.take().expect("envelope not dropped").0)
     }
 
     #[cfg(feature = "http2")]
@@ -149,17 +151,17 @@ impl<T, U> UnboundedSender<T, U> {
     pub(crate) fn try_send(&mut self, val: T) -> Result<RetryPromise<T, U>, T> {
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::Retry(Some(tx))))))
+            .unbounded_send(Envelope(Some((val, Callback::Retry(Some(tx))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|e| e.into_inner().0.take().expect("envelope not dropped").0)
     }
 
     pub(crate) fn send(&mut self, val: T) -> Result<Promise<U>, T> {
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
+            .unbounded_send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|e| e.into_inner().0.take().expect("envelope not dropped").0)
     }
 }
 
@@ -180,7 +182,7 @@ pub(crate) struct Receiver<T, U> {
 
 impl<T, U> Receiver<T, U> {
     pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<(T, Callback<T, U>)>> {
-        match self.inner.poll_recv(cx) {
+        match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(item) => {
                 Poll::Ready(item.map(|mut env| env.0.take().expect("envelope not dropped")))
             }
@@ -199,8 +201,10 @@ impl<T, U> Receiver<T, U> {
 
     #[cfg(feature = "http1")]
     pub(crate) fn try_recv(&mut self) -> Option<(T, Callback<T, U>)> {
-        match crate::common::task::now_or_never(self.inner.recv()) {
-            Some(Some(mut env)) => env.0.take(),
+        let waker = crate::common::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match Pin::new(&mut self.inner).poll_next(&mut cx) {
+            Poll::Ready(Some(mut env)) => env.0.take(),
             _ => None,
         }
     }
@@ -267,16 +271,16 @@ impl<T, U> Callback<T, U> {
     #[cfg(feature = "http2")]
     pub(crate) fn is_canceled(&self) -> bool {
         match self {
-            Callback::Retry(Some(tx)) => tx.is_closed(),
-            Callback::NoRetry(Some(tx)) => tx.is_closed(),
+            Callback::Retry(Some(tx)) => tx.is_canceled(),
+            Callback::NoRetry(Some(tx)) => tx.is_canceled(),
             _ => unreachable!(),
         }
     }
 
     pub(crate) fn poll_canceled(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match self {
-            Callback::Retry(Some(tx)) => tx.poll_closed(cx),
-            Callback::NoRetry(Some(tx)) => tx.poll_closed(cx),
+            Callback::Retry(Some(tx)) => tx.poll_canceled(cx),
+            Callback::NoRetry(Some(tx)) => tx.poll_canceled(cx),
             _ => unreachable!(),
         }
     }
@@ -453,7 +457,7 @@ mod tests {
         let (mut tx, mut rx) = channel::<Custom, ()>();
 
         // one is allowed to buffer, second is rejected
-        tx.try_send(Custom(1)).expect("1 buffered");
+        let _ = tx.try_send(Custom(1)).expect("1 buffered");
         tx.try_send(Custom(2)).expect_err("2 not ready");
 
         assert!(PollOnce(&mut rx).await.is_some(), "rx once");
@@ -464,7 +468,7 @@ mod tests {
 
         assert!(PollOnce(&mut rx).await.is_none(), "rx empty");
 
-        tx.try_send(Custom(2)).expect("2 ready");
+        let _ = tx.try_send(Custom(2)).expect("2 ready");
     }
 
     #[cfg(feature = "http2")]
@@ -473,9 +477,9 @@ mod tests {
         let (tx, rx) = channel::<Custom, ()>();
         let mut tx = tx.unbound();
 
-        tx.try_send(Custom(1)).unwrap();
-        tx.try_send(Custom(2)).unwrap();
-        tx.try_send(Custom(3)).unwrap();
+        let _ = tx.try_send(Custom(1)).unwrap();
+        let _ = tx.try_send(Custom(2)).unwrap();
+        let _ = tx.try_send(Custom(3)).unwrap();
 
         drop(rx);
 
@@ -493,7 +497,7 @@ mod tests {
         let (mut tx, mut rx) = channel::<Request<Incoming>, Response<Incoming>>();
 
         b.iter(move || {
-            tx.send(Request::new(Incoming::empty())).unwrap();
+            let _ = tx.send(Request::new(Incoming::empty())).unwrap();
             rt.block_on(async {
                 loop {
                     let poll_once = PollOnce(&mut rx);
