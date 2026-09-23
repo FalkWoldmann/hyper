@@ -8,8 +8,8 @@ use http::{Request, Response};
 use http_body::Body;
 #[cfg(feature = "http2")]
 use pin_project_lite::pin_project;
-use tokio::sync::{mpsc, oneshot};
 
+use crate::common::{mpsc, oneshot};
 #[cfg(feature = "http2")]
 use crate::{body::Incoming, proto::h2::client::ResponseFutMap};
 
@@ -29,7 +29,7 @@ pub struct TrySendError<T> {
 }
 
 pub(crate) fn channel<T, U>() -> (Sender<T, U>, Receiver<T, U>) {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::unbounded();
     let (giver, taker) = want::new();
     let tx = Sender {
         #[cfg(feature = "http1")]
@@ -57,7 +57,7 @@ pub(crate) struct Sender<T, U> {
     /// for more.
     giver: want::Giver,
     /// Actually bounded by the Giver, plus `buffered_once`.
-    inner: mpsc::UnboundedSender<Envelope<T, U>>,
+    inner: mpsc::Sender<Envelope<T, U>>,
 }
 
 /// An unbounded version.
@@ -66,9 +66,9 @@ pub(crate) struct Sender<T, U> {
 /// has been dropped. However, this version can be cloned.
 #[cfg(feature = "http2")]
 pub(crate) struct UnboundedSender<T, U> {
-    /// Only used for `is_closed`, since `mpsc::UnboundedSender` cannot be checked.
+    /// Only used for `is_closed`, since `mpsc::Sender` cannot be checked.
     giver: want::SharedGiver,
-    inner: mpsc::UnboundedSender<Envelope<T, U>>,
+    inner: mpsc::Sender<Envelope<T, U>>,
 }
 
 impl<T, U> Sender<T, U> {
@@ -112,7 +112,7 @@ impl<T, U> Sender<T, U> {
         self.inner
             .send(Envelope(Some((val, Callback::Retry(Some(tx))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|mut e| e.0.take().expect("envelope not dropped").0)
     }
 
     #[cfg(feature = "http1")]
@@ -124,7 +124,7 @@ impl<T, U> Sender<T, U> {
         self.inner
             .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|mut e| e.0.take().expect("envelope not dropped").0)
     }
 
     #[cfg(feature = "http2")]
@@ -151,7 +151,7 @@ impl<T, U> UnboundedSender<T, U> {
         self.inner
             .send(Envelope(Some((val, Callback::Retry(Some(tx))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|mut e| e.0.take().expect("envelope not dropped").0)
     }
 
     pub(crate) fn send(&mut self, val: T) -> Result<Promise<U>, T> {
@@ -159,7 +159,7 @@ impl<T, U> UnboundedSender<T, U> {
         self.inner
             .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|mut e| e.0.take().expect("envelope not dropped").0)
     }
 }
 
@@ -174,7 +174,7 @@ impl<T, U> Clone for UnboundedSender<T, U> {
 }
 
 pub(crate) struct Receiver<T, U> {
-    inner: mpsc::UnboundedReceiver<Envelope<T, U>>,
+    inner: mpsc::Receiver<Envelope<T, U>>,
     taker: want::Taker,
 }
 
@@ -199,10 +199,8 @@ impl<T, U> Receiver<T, U> {
 
     #[cfg(feature = "http1")]
     pub(crate) fn try_recv(&mut self) -> Option<(T, Callback<T, U>)> {
-        match crate::common::task::now_or_never(self.inner.recv()) {
-            Some(Some(mut env)) => env.0.take(),
-            _ => None,
-        }
+        let mut env = self.inner.try_recv()?;
+        env.0.take()
     }
 }
 
@@ -267,16 +265,16 @@ impl<T, U> Callback<T, U> {
     #[cfg(feature = "http2")]
     pub(crate) fn is_canceled(&self) -> bool {
         match self {
-            Callback::Retry(Some(tx)) => tx.is_closed(),
-            Callback::NoRetry(Some(tx)) => tx.is_closed(),
+            Callback::Retry(Some(tx)) => tx.is_canceled(),
+            Callback::NoRetry(Some(tx)) => tx.is_canceled(),
             _ => unreachable!(),
         }
     }
 
     pub(crate) fn poll_canceled(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match self {
-            Callback::Retry(Some(tx)) => tx.poll_closed(cx),
-            Callback::NoRetry(Some(tx)) => tx.poll_closed(cx),
+            Callback::Retry(Some(tx)) => tx.poll_canceled(cx),
+            Callback::NoRetry(Some(tx)) => tx.poll_canceled(cx),
             _ => unreachable!(),
         }
     }
@@ -453,7 +451,7 @@ mod tests {
         let (mut tx, mut rx) = channel::<Custom, ()>();
 
         // one is allowed to buffer, second is rejected
-        tx.try_send(Custom(1)).expect("1 buffered");
+        let _ = tx.try_send(Custom(1)).expect("1 buffered");
         tx.try_send(Custom(2)).expect_err("2 not ready");
 
         assert!(PollOnce(&mut rx).await.is_some(), "rx once");
@@ -464,7 +462,7 @@ mod tests {
 
         assert!(PollOnce(&mut rx).await.is_none(), "rx empty");
 
-        tx.try_send(Custom(2)).expect("2 ready");
+        let _ = tx.try_send(Custom(2)).expect("2 ready");
     }
 
     #[cfg(feature = "http2")]
@@ -473,9 +471,9 @@ mod tests {
         let (tx, rx) = channel::<Custom, ()>();
         let mut tx = tx.unbound();
 
-        tx.try_send(Custom(1)).unwrap();
-        tx.try_send(Custom(2)).unwrap();
-        tx.try_send(Custom(3)).unwrap();
+        let _ = tx.try_send(Custom(1)).unwrap();
+        let _ = tx.try_send(Custom(2)).unwrap();
+        let _ = tx.try_send(Custom(3)).unwrap();
 
         drop(rx);
 
@@ -493,7 +491,7 @@ mod tests {
         let (mut tx, mut rx) = channel::<Request<Incoming>, Response<Incoming>>();
 
         b.iter(move || {
-            tx.send(Request::new(Incoming::empty())).unwrap();
+            let _ = tx.send(Request::new(Incoming::empty())).unwrap();
             rt.block_on(async {
                 loop {
                     let poll_once = PollOnce(&mut rx);
