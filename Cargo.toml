@@ -24,6 +24,7 @@ bytes = "1.2"
 http = "1"
 http-body = "1"
 tokio = { version = "1", features = ["sync"] }
+crossfire = "3.1.20"
 
 # Optional
 

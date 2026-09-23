@@ -8,13 +8,36 @@ use http::{Request, Response};
 use http_body::Body;
 #[cfg(feature = "http2")]
 use pin_project_lite::pin_project;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 #[cfg(feature = "http2")]
 use crate::{body::Incoming, proto::h2::client::ResponseFutMap};
 
 pub(crate) type RetryPromise<T, U> = oneshot::Receiver<Result<U, TrySendError<T>>>;
 pub(crate) type Promise<T> = oneshot::Receiver<Result<T, crate::Error>>;
+
+// EXPERIMENT ONLY (benchmarking): crossfire's lock-free unbounded MPSC queue in
+// place of tokio's. crossfire requires `T: Send + 'static`, which hyper's
+// dispatcher doesn't have (it supports `!Send` bodies), so each envelope is
+// boxed and sent as a type-erased pointer. This is unsound for `!Send` bodies
+// and costs one extra allocation per request; it is not meant to be merged.
+struct Erased(*mut ());
+// SAFETY: not actually guaranteed; see the note above.
+unsafe impl Send for Erased {}
+
+type QueueTx = crossfire::MTx<crossfire::mpsc::List<Erased>>;
+type QueueRx = crossfire::stream::AsyncStream<crossfire::mpsc::List<Erased>>;
+
+fn erase<T, U>(env: Envelope<T, U>) -> Erased {
+    Erased(Box::into_raw(Box::new(env)).cast())
+}
+
+/// # Safety
+///
+/// `erased` must come from `erase::<T, U>` and be unerased only once.
+unsafe fn unerase<T, U>(erased: Erased) -> Envelope<T, U> {
+    *unsafe { Box::from_raw(erased.0.cast::<Envelope<T, U>>()) }
+}
 
 /// An error when calling `try_send_request`.
 ///
@@ -29,15 +52,21 @@ pub struct TrySendError<T> {
 }
 
 pub(crate) fn channel<T, U>() -> (Sender<T, U>, Receiver<T, U>) {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = crossfire::mpsc::unbounded_async();
+    let rx = rx.into_stream();
     let (giver, taker) = want::new();
     let tx = Sender {
         #[cfg(feature = "http1")]
         buffered_once: false,
         giver,
         inner: tx,
+        _marker: std::marker::PhantomData,
     };
-    let rx = Receiver { inner: rx, taker };
+    let rx = Receiver {
+        inner: rx,
+        taker,
+        _marker: std::marker::PhantomData,
+    };
     (tx, rx)
 }
 
@@ -57,7 +86,8 @@ pub(crate) struct Sender<T, U> {
     /// for more.
     giver: want::Giver,
     /// Actually bounded by the Giver, plus `buffered_once`.
-    inner: mpsc::UnboundedSender<Envelope<T, U>>,
+    inner: QueueTx,
+    _marker: std::marker::PhantomData<fn() -> (T, U)>,
 }
 
 /// An unbounded version.
@@ -68,7 +98,8 @@ pub(crate) struct Sender<T, U> {
 pub(crate) struct UnboundedSender<T, U> {
     /// Only used for `is_closed`, since `mpsc::UnboundedSender` cannot be checked.
     giver: want::SharedGiver,
-    inner: mpsc::UnboundedSender<Envelope<T, U>>,
+    inner: QueueTx,
+    _marker: std::marker::PhantomData<fn() -> (T, U)>,
 }
 
 impl<T, U> Sender<T, U> {
@@ -110,9 +141,13 @@ impl<T, U> Sender<T, U> {
         }
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::Retry(Some(tx))))))
+            .send(erase(Envelope(Some((val, Callback::Retry(Some(tx)))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|e| {
+                // SAFETY: erased just above with these types, returned unsent.
+                let mut env = unsafe { unerase::<T, U>(e.0) };
+                env.0.take().expect("envelope not dropped").0
+            })
     }
 
     #[cfg(feature = "http1")]
@@ -122,9 +157,13 @@ impl<T, U> Sender<T, U> {
         }
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
+            .send(erase(Envelope(Some((val, Callback::NoRetry(Some(tx)))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|e| {
+                // SAFETY: erased just above with these types, returned unsent.
+                let mut env = unsafe { unerase::<T, U>(e.0) };
+                env.0.take().expect("envelope not dropped").0
+            })
     }
 
     #[cfg(feature = "http2")]
@@ -132,6 +171,7 @@ impl<T, U> Sender<T, U> {
         UnboundedSender {
             giver: self.giver.shared(),
             inner: self.inner,
+            _marker: std::marker::PhantomData,
         }
     }
 }
@@ -149,17 +189,25 @@ impl<T, U> UnboundedSender<T, U> {
     pub(crate) fn try_send(&mut self, val: T) -> Result<RetryPromise<T, U>, T> {
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::Retry(Some(tx))))))
+            .send(erase(Envelope(Some((val, Callback::Retry(Some(tx)))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|e| {
+                // SAFETY: erased just above with these types, returned unsent.
+                let mut env = unsafe { unerase::<T, U>(e.0) };
+                env.0.take().expect("envelope not dropped").0
+            })
     }
 
     pub(crate) fn send(&mut self, val: T) -> Result<Promise<U>, T> {
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
+            .send(erase(Envelope(Some((val, Callback::NoRetry(Some(tx)))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|e| {
+                // SAFETY: erased just above with these types, returned unsent.
+                let mut env = unsafe { unerase::<T, U>(e.0) };
+                env.0.take().expect("envelope not dropped").0
+            })
     }
 }
 
@@ -169,21 +217,25 @@ impl<T, U> Clone for UnboundedSender<T, U> {
         UnboundedSender {
             giver: self.giver.clone(),
             inner: self.inner.clone(),
+            _marker: std::marker::PhantomData,
         }
     }
 }
 
 pub(crate) struct Receiver<T, U> {
-    inner: mpsc::UnboundedReceiver<Envelope<T, U>>,
+    inner: QueueRx,
+    _marker: std::marker::PhantomData<fn() -> (T, U)>,
     taker: want::Taker,
 }
 
 impl<T, U> Receiver<T, U> {
     pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<(T, Callback<T, U>)>> {
-        match self.inner.poll_recv(cx) {
-            Poll::Ready(item) => {
-                Poll::Ready(item.map(|mut env| env.0.take().expect("envelope not dropped")))
-            }
+        match self.inner.poll_item(cx) {
+            Poll::Ready(item) => Poll::Ready(item.map(|erased| {
+                // SAFETY: every queued pointer was erased by a sender with these types.
+                let mut env = unsafe { unerase::<T, U>(erased) };
+                env.0.take().expect("envelope not dropped")
+            })),
             Poll::Pending => {
                 self.taker.want();
                 Poll::Pending
@@ -193,16 +245,17 @@ impl<T, U> Receiver<T, U> {
 
     #[cfg(feature = "http1")]
     pub(crate) fn close(&mut self) {
+        // crossfire's async receiver can't be closed while kept alive; cancelling
+        // `want` stops `Sender::try_send` / `send` from queueing more.
         self.taker.cancel();
-        self.inner.close();
     }
 
     #[cfg(feature = "http1")]
     pub(crate) fn try_recv(&mut self) -> Option<(T, Callback<T, U>)> {
-        match crate::common::task::now_or_never(self.inner.recv()) {
-            Some(Some(mut env)) => env.0.take(),
-            _ => None,
-        }
+        let erased = self.inner.try_recv().ok()?;
+        // SAFETY: every queued pointer was erased by a sender with these types.
+        let mut env = unsafe { unerase::<T, U>(erased) };
+        env.0.take()
     }
 }
 
@@ -211,6 +264,13 @@ impl<T, U> Drop for Receiver<T, U> {
         // Notify the giver about the closure first, before dropping
         // the mpsc::Receiver.
         self.taker.cancel();
+        // crossfire frees queued messages only when the last sender drops (and
+        // then only the pointers), so fail queued requests now, as tokio's
+        // receiver does on drop. A send racing this drain is leaked.
+        while let Ok(erased) = self.inner.try_recv() {
+            // SAFETY: every queued pointer was erased by a sender with these types.
+            drop(unsafe { unerase::<T, U>(erased) });
+        }
     }
 }
 
