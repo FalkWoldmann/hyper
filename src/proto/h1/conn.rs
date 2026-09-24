@@ -795,9 +795,8 @@ where
     pub(crate) fn end_body(&mut self) -> crate::Result<()> {
         debug_assert!(self.can_write_body());
 
-        let encoder = match &mut self.state.writing {
-            Writing::Body(enc) => enc,
-            _ => return Ok(()),
+        let Writing::Body(encoder) = &mut self.state.writing else {
+            return Ok(());
         };
 
         // end of stream, that means we should try to eof

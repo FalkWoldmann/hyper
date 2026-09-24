@@ -1323,9 +1323,7 @@ impl Client {
         }
     }
     fn set_length(head: &mut RequestHead, body: Option<BodyLength>) -> Encoder {
-        let body = if let Some(body) = body {
-            body
-        } else {
+        let Some(body) = body else {
             head.headers.remove(header::TRANSFER_ENCODING);
             return Encoder::length(0);
         };
@@ -1446,9 +1444,7 @@ impl Client {
         // User didn't set transfer-encoding, AND we know body length,
         // so we can just set the Content-Length automatically.
 
-        let len = if let BodyLength::Known(len) = body {
-            len
-        } else {
+        let BodyLength::Known(len) = body else {
             unreachable!("BodyLength::Unknown would set chunked");
         };
 
@@ -1471,9 +1467,8 @@ impl Client {
         let buf = &mut all[idx.value.0..idx.value.1];
 
         // look for a newline, otherwise bail out
-        let first_nl = match buf.iter().position(|b| *b == b'\n') {
-            Some(i) => i,
-            None => return,
+        let Some(first_nl) = buf.iter().position(|b| *b == b'\n') else {
+            return;
         };
 
         // not on standard slices because whatever, sigh

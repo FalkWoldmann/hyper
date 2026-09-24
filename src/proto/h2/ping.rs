@@ -191,9 +191,7 @@ impl Config {
 
 impl Recorder {
     pub(crate) fn record_data(&self, len: usize) {
-        let shared = if let Some(shared) = &self.shared {
-            shared
-        } else {
+        let Some(shared) = &self.shared else {
             return;
         };
 
@@ -225,9 +223,7 @@ impl Recorder {
     }
 
     pub(crate) fn record_non_data(&self) {
-        let shared = if let Some(shared) = &self.shared {
-            shared
-        } else {
+        let Some(shared) = &self.shared else {
             return;
         };
 

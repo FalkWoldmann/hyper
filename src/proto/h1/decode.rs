@@ -644,24 +644,18 @@ fn decode_trailers(buf: &mut BytesMut, count: usize) -> Result<HeaderMap, io::Er
         Ok(httparse::Status::Complete((_, headers))) => {
             for header in headers {
                 use std::convert::TryFrom;
-                let name = match HeaderName::try_from(header.name) {
-                    Ok(name) => name,
-                    Err(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("Invalid header name: {:?}", &header),
-                        ));
-                    }
+                let Ok(name) = HeaderName::try_from(header.name) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Invalid header name: {:?}", &header),
+                    ));
                 };
 
-                let value = match HeaderValue::from_bytes(header.value) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("Invalid header value: {:?}", &header),
-                        ));
-                    }
+                let Ok(value) = HeaderValue::from_bytes(header.value) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Invalid header value: {:?}", &header),
+                    ));
                 };
 
                 trailers.append(name, value);
