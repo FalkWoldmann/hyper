@@ -48,9 +48,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use crate::common::oneshot;
 use crate::rt::{Read, ReadBufCursor, Write};
 use bytes::Bytes;
-use tokio::sync::oneshot;
 
 use crate::common::io::Rewind;
 use crate::common::lock::LockResultExt;
