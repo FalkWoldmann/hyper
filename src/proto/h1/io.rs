@@ -4,8 +4,8 @@ use std::io::{self, IoSlice};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::rt::{Read, ReadBuf, Write};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use crate::rt::{Read, Write};
+use bytes::{Buf, Bytes, BytesMut};
 use futures_core::ready;
 
 use super::{Http1Transaction, ParseContext, ParsedMessage};
@@ -29,9 +29,15 @@ pub(crate) const DEFAULT_MAX_BUFFER_SIZE: usize = 8192 + 4096 * 100;
 /// forces a flush if the queue gets this big.
 const MAX_BUF_LIST_BUFFERS: usize = 16;
 
+/// When the IO needs owned buffers, copy chunks smaller than this to a
+/// buffer of our own, and write bigger ones as they are.
+const OWNED_COPY_THRESHOLD: usize = 1024;
+
 pub(crate) struct Buffered<T, B> {
     flush_pipeline: bool,
     io: T,
+    /// Set if the IO needs owned buffers.
+    owned_write: Option<OwnedWrite>,
     partial_len: Option<usize>,
     read_blocked: bool,
     read_buf: BytesMut,
@@ -57,7 +63,12 @@ where
     B: Buf,
 {
     pub(crate) fn new(io: T) -> Buffered<T, B> {
-        let strategy = if io.is_write_vectored() {
+        let owned_write = if io.needs_owned_buffers() {
+            Some(OwnedWrite::new())
+        } else {
+            None
+        };
+        let strategy = if io.is_write_vectored() || owned_write.is_some() {
             WriteStrategy::Queue
         } else {
             WriteStrategy::Flatten
@@ -66,6 +77,7 @@ where
         Buffered {
             flush_pipeline: false,
             io,
+            owned_write,
             partial_len: None,
             read_blocked: false,
             read_buf: BytesMut::with_capacity(0),
@@ -151,11 +163,19 @@ where
 
     /// Whether there are bytes waiting in the write buffer to be flushed.
     pub(crate) fn has_buffered_write(&self) -> bool {
-        self.write_buf.remaining() > 0
+        self.write_buf.remaining() > 0 || self.owned_remaining() > 0
     }
 
     pub(crate) fn can_buffer(&self) -> bool {
-        self.flush_pipeline || self.write_buf.can_buffer()
+        self.flush_pipeline
+            || (self.write_buf.can_buffer()
+                && self.write_buf.remaining() + self.owned_remaining()
+                    < self.write_buf.max_buf_size)
+    }
+
+    /// The bytes an owned write still has to write.
+    fn owned_remaining(&self) -> usize {
+        self.owned_write.as_ref().map_or(0, |owned| owned.remaining)
     }
 
     pub(crate) fn consume_leading_lines(&mut self) {
@@ -229,33 +249,27 @@ where
     }
 
     pub(crate) fn poll_read_from_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        // An owned read that is in flight has the spare capacity of the
+        // buffer, and gives it back once it completes.
+        let in_flight = self.read_blocked && self.owned_write.is_some();
         self.read_blocked = false;
-        // Get the next amount to allocate, but make sure we don't go over
-        // the max read buf size configured.
-        let next = cmp::min(
-            self.read_buf_strategy.next(),
-            self.read_buf_strategy
-                .max()
-                .saturating_sub(self.read_buf.len()),
-        );
-        if self.read_buf_remaining_mut() < next {
-            self.read_buf.reserve(next);
+        if !in_flight {
+            // Get the next amount to allocate, but make sure we don't go over
+            // the max read buf size configured.
+            let next = cmp::min(
+                self.read_buf_strategy.next(),
+                self.read_buf_strategy
+                    .max()
+                    .saturating_sub(self.read_buf.len()),
+            );
+            if self.read_buf_remaining_mut() < next {
+                self.read_buf.reserve(next);
+            }
         }
 
-        // SAFETY: ReadBuf and poll_read promise not to set any uninitialized
-        // bytes onto `dst`.
-        let dst = unsafe { self.read_buf.chunk_mut().as_uninit_slice_mut() };
-        let mut buf = ReadBuf::uninit(dst);
-        match Pin::new(&mut self.io).poll_read(cx, buf.unfilled()) {
-            Poll::Ready(Ok(())) => {
-                let n = buf.filled().len();
+        match Pin::new(&mut self.io).poll_read_buf(cx, &mut self.read_buf) {
+            Poll::Ready(Ok(n)) => {
                 trace!("received {} bytes", n);
-                // Safety: we just read that many bytes into the
-                // uninitialized part of the buffer, so this is okay.
-                // @tokio pls give me back `poll_read_buf` thanks
-                unsafe {
-                    self.read_buf.advance_mut(n);
-                }
                 self.read_buf_strategy.record(n);
                 Poll::Ready(Ok(n))
             }
@@ -278,6 +292,8 @@ where
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.flush_pipeline && !self.read_buf.is_empty() {
             Poll::Ready(Ok(()))
+        } else if self.owned_write.is_some() {
+            self.poll_flush_owned(cx)
         } else if self.write_buf.remaining() == 0 {
             Pin::new(&mut self.io).poll_flush(cx)
         } else {
@@ -329,6 +345,31 @@ where
                     self.write_buf.remaining()
                 );
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+        }
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    /// Version of `flush` for an IO that needs owned buffers.
+    fn poll_flush_owned(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(owned) = &mut self.owned_write {
+            loop {
+                if owned.remaining == 0 {
+                    if self.write_buf.remaining() == 0 {
+                        break;
+                    }
+                    owned.fill(&mut self.write_buf);
+                }
+                let n = ready!(Pin::new(&mut self.io).poll_write_owned(cx, owned.bufs()))?;
+                debug!("flushed {} bytes", n);
+                if n == 0 {
+                    trace!(
+                        "write returned zero, but {} bytes remaining",
+                        owned.remaining
+                    );
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                }
+                owned.advance(n);
             }
         }
         Pin::new(&mut self.io).poll_flush(cx)
@@ -649,6 +690,83 @@ impl<B: Buf> Buf for WriteBuf<B> {
 enum WriteStrategy {
     Flatten,
     Queue,
+}
+
+/// What is written to an IO that needs owned buffers.
+struct OwnedWrite {
+    /// The buffers being written. Those before `pos` are written.
+    bufs: Vec<Bytes>,
+    pos: usize,
+    remaining: usize,
+    /// Re-usable buffer the headers and small chunks are copied to.
+    stage: BytesMut,
+}
+
+impl OwnedWrite {
+    fn new() -> OwnedWrite {
+        OwnedWrite {
+            bufs: Vec::new(),
+            pos: 0,
+            remaining: 0,
+            stage: BytesMut::with_capacity(INIT_BUFFER_SIZE),
+        }
+    }
+
+    fn bufs(&self) -> &[Bytes] {
+        &self.bufs[self.pos..]
+    }
+
+    /// Moves everything out of `write_buf`.
+    fn fill<B: Buf>(&mut self, write_buf: &mut WriteBuf<B>) {
+        debug_assert_eq!(self.remaining, 0);
+        // Nothing else refers to `stage` after this, so it gets to re-use
+        // its allocation.
+        self.bufs.clear();
+        self.pos = 0;
+
+        self.stage.extend_from_slice(write_buf.headers.chunk());
+        write_buf.headers.reset();
+
+        let queue = &mut write_buf.queue;
+        while queue.has_remaining() {
+            let len = queue.chunk().len();
+            if len < OWNED_COPY_THRESHOLD {
+                self.stage.extend_from_slice(queue.chunk());
+                queue.advance(len);
+            } else {
+                self.push_stage();
+                self.push(queue.copy_to_bytes(len));
+            }
+        }
+        self.push_stage();
+    }
+
+    fn push_stage(&mut self) {
+        if !self.stage.is_empty() {
+            let buf = self.stage.split().freeze();
+            self.push(buf);
+        }
+    }
+
+    fn push(&mut self, buf: Bytes) {
+        self.remaining += buf.len();
+        self.bufs.push(buf);
+    }
+
+    fn advance(&mut self, mut cnt: usize) {
+        debug_assert!(cnt <= self.remaining);
+        self.remaining -= cnt;
+        while cnt > 0 {
+            let buf = &mut self.bufs[self.pos];
+            if cnt < buf.len() {
+                buf.advance(cnt);
+                break;
+            }
+            cnt -= buf.len();
+            *buf = Bytes::new();
+            self.pos += 1;
+        }
+    }
 }
 
 #[cfg(test)]

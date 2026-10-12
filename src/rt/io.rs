@@ -4,6 +4,8 @@ use std::ops::DerefMut;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use bytes::{BufMut, Bytes, BytesMut};
+
 // New IO traits? What?! Why, are you bonkers?
 //
 // I mean, yes, probably. But, here's the goals:
@@ -86,6 +88,41 @@ pub trait Read {
         cx: &mut Context<'_>,
         buf: ReadBufCursor<'_>,
     ) -> Poll<Result<(), std::io::Error>>;
+
+    /// Attempts to read bytes into the spare capacity of `buf`, and returns
+    /// how many were read. `Ok(0)` implies that EOF has been reached.
+    ///
+    /// A completion-based implementation (io_uring, IOCP) may detach the
+    /// spare capacity of `buf` (with `split_off(buf.len())`) when it submits
+    /// a read, so the kernel can write into it after this call returns
+    /// `Poll::Pending`. It must put it back (with `unsplit`), with the new
+    /// bytes appended, before it returns `Poll::Ready`. The bytes already in
+    /// `buf` stay in place.
+    ///
+    /// The default implementation reads with `poll_read`.
+    fn poll_read_buf(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut BytesMut,
+    ) -> Poll<Result<usize, std::io::Error>> {
+        // SAFETY: ReadBuf and poll_read promise not to set any uninitialized
+        // bytes onto `dst`.
+        let dst = unsafe { buf.chunk_mut().as_uninit_slice_mut() };
+        let mut read_buf = ReadBuf::uninit(dst);
+        match self.poll_read(cx, read_buf.unfilled()) {
+            Poll::Ready(Ok(())) => {
+                let n = read_buf.filled().len();
+                // SAFETY: that many bytes were just read into the
+                // uninitialized part of the buffer.
+                unsafe {
+                    buf.advance_mut(n);
+                }
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 /// Write bytes asynchronously.
@@ -142,6 +179,39 @@ pub trait Write {
             .find(|b| !b.is_empty())
             .map_or(&[][..], |b| &**b);
         self.poll_write(cx, buf)
+    }
+
+    /// Returns whether this writer needs owned buffers, as completion-based
+    /// I/O (io_uring, IOCP) does.
+    ///
+    /// When `true`, hyper writes only with `poll_write_owned`.
+    ///
+    /// The default implementation returns `false`.
+    fn needs_owned_buffers(&self) -> bool {
+        false
+    }
+
+    /// Like `poll_write_vectored`, except that it writes from buffers that
+    /// are reference counted, so an implementation can clone them into an
+    /// operation that outlives this call.
+    ///
+    /// After `Poll::Pending`, the same `bufs` are passed again. An
+    /// implementation must drop its clones before it returns `Poll::Ready`.
+    ///
+    /// The default implementation writes with `poll_write_vectored`.
+    fn poll_write_owned(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[Bytes],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        const MAX_BUFS: usize = 16;
+        let mut slices = [std::io::IoSlice::new(&[]); MAX_BUFS];
+        let mut n = 0;
+        for (slot, buf) in slices.iter_mut().zip(bufs.iter().filter(|b| !b.is_empty())) {
+            *slot = std::io::IoSlice::new(buf);
+            n += 1;
+        }
+        self.poll_write_vectored(cx, &slices[..n])
     }
 }
 
@@ -276,25 +346,25 @@ impl<'data> ReadBuf<'data> {
     }
 
     #[inline]
-    #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
+    #[cfg(all(test, any(feature = "client", feature = "server"), feature = "http2"))]
     pub(crate) unsafe fn set_init(&mut self, n: usize) {
         self.init = self.init.max(n);
     }
 
     #[inline]
-    #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
+    #[cfg(all(test, any(feature = "client", feature = "server"), feature = "http2"))]
     pub(crate) unsafe fn set_filled(&mut self, n: usize) {
         self.filled = self.filled.max(n);
     }
 
     #[inline]
-    #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
+    #[cfg(all(test, any(feature = "client", feature = "server"), feature = "http2"))]
     pub(crate) fn len(&self) -> usize {
         self.filled
     }
 
     #[inline]
-    #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
+    #[cfg(all(test, any(feature = "client", feature = "server"), feature = "http2"))]
     pub(crate) fn init_len(&self) -> usize {
         self.init
     }
@@ -438,6 +508,14 @@ macro_rules! deref_async_read {
         ) -> Poll<std::io::Result<()>> {
             Pin::new(&mut **self).poll_read(cx, buf)
         }
+
+        fn poll_read_buf(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut BytesMut,
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut **self).poll_read_buf(cx, buf)
+        }
     };
 }
 
@@ -461,6 +539,14 @@ where
     ) -> Poll<std::io::Result<()>> {
         pin_as_deref_mut(self).poll_read(cx, buf)
     }
+
+    fn poll_read_buf(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut BytesMut,
+    ) -> Poll<std::io::Result<usize>> {
+        pin_as_deref_mut(self).poll_read_buf(cx, buf)
+    }
 }
 
 macro_rules! deref_async_write {
@@ -483,6 +569,18 @@ macro_rules! deref_async_write {
 
         fn is_write_vectored(&self) -> bool {
             (**self).is_write_vectored()
+        }
+
+        fn needs_owned_buffers(&self) -> bool {
+            (**self).needs_owned_buffers()
+        }
+
+        fn poll_write_owned(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[Bytes],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut **self).poll_write_owned(cx, bufs)
         }
 
         fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -529,6 +627,18 @@ where
 
     fn is_write_vectored(&self) -> bool {
         (**self).is_write_vectored()
+    }
+
+    fn needs_owned_buffers(&self) -> bool {
+        (**self).needs_owned_buffers()
+    }
+
+    fn poll_write_owned(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[Bytes],
+    ) -> Poll<std::io::Result<usize>> {
+        pin_as_deref_mut(self).poll_write_owned(cx, bufs)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {

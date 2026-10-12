@@ -332,6 +332,17 @@ where
             BufKind::Trailers(b) => b.chunks_vectored(dst),
         }
     }
+
+    #[inline]
+    fn copy_to_bytes(&mut self, len: usize) -> Bytes {
+        match &mut self.kind {
+            BufKind::Exact(b) => b.copy_to_bytes(len),
+            BufKind::Limited(b) => b.copy_to_bytes(len),
+            BufKind::Chunked(b) => b.copy_to_bytes(len),
+            BufKind::ChunkedEnd(b) => b.copy_to_bytes(len),
+            BufKind::Trailers(b) => b.copy_to_bytes(len),
+        }
+    }
 }
 
 const USIZE_BYTES: usize = std::mem::size_of::<usize>();

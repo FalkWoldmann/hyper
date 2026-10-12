@@ -4,7 +4,7 @@ use std::io::{Cursor, IoSlice};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use futures_core::ready;
 use h2::SendStream;
 use http::header::{HeaderName, CONNECTION, TRANSFER_ENCODING, UPGRADE};
@@ -324,6 +324,15 @@ impl<B: Buf> Buf for SendBuf<B> {
             Self::Buf(b) => b.chunks_vectored(dst),
             Self::Cursor(c) => c.chunks_vectored(dst),
             Self::None => 0,
+        }
+    }
+
+    #[inline]
+    fn copy_to_bytes(&mut self, len: usize) -> Bytes {
+        match self {
+            Self::Buf(b) => b.copy_to_bytes(len),
+            Self::Cursor(c) => c.copy_to_bytes(len),
+            Self::None => Bytes::new().copy_to_bytes(len),
         }
     }
 }

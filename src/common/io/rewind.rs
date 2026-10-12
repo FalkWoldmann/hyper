@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{cmp, io};
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 
 use crate::rt::{Read, ReadBufCursor, Write};
 
@@ -74,6 +74,31 @@ where
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
+
+    fn poll_read_buf(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut BytesMut,
+    ) -> Poll<io::Result<usize>> {
+        if let Some(mut prefix) = self.pre.take() {
+            // If there are no remaining bytes, let the bytes get dropped.
+            if !prefix.is_empty() {
+                if buf.capacity() == buf.len() {
+                    buf.reserve(64);
+                }
+                let copy_len = cmp::min(prefix.len(), buf.capacity() - buf.len());
+                buf.extend_from_slice(&prefix[..copy_len]);
+                prefix.advance(copy_len);
+                // Put back what's left
+                if !prefix.is_empty() {
+                    self.pre = Some(prefix);
+                }
+
+                return Poll::Ready(Ok(copy_len));
+            }
+        }
+        Pin::new(&mut self.inner).poll_read_buf(cx, buf)
+    }
 }
 
 impl<T> Write for Rewind<T>
@@ -106,6 +131,18 @@ where
 
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
+    }
+
+    fn needs_owned_buffers(&self) -> bool {
+        self.inner.needs_owned_buffers()
+    }
+
+    fn poll_write_owned(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[Bytes],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_owned(cx, bufs)
     }
 }
 

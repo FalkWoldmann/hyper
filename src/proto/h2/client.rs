@@ -22,7 +22,7 @@ use super::{ping, PipeToSendStream, SendBuf};
 use crate::body::{Body, Incoming as IncomingBody};
 use crate::client::dispatch::{Callback, SendWhen, TrySendError};
 use crate::common::either::Either;
-use crate::common::io::Compat;
+use crate::common::io::H2Io;
 use crate::common::time::Time;
 use crate::ext::Protocol;
 use crate::headers;
@@ -162,7 +162,7 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let (h2_tx, mut conn) = new_builder(config)
-        .handshake::<_, SendBuf<B::Data>>(Compat::new(io))
+        .handshake::<_, SendBuf<B::Data>>(H2Io::new(io))
         .await
         .map_err(crate::Error::new_h2)?;
 
@@ -213,7 +213,7 @@ pin_project! {
         #[pin]
         ponger: Ponger,
         #[pin]
-        conn: Connection<Compat<T>, SendBuf<<B as Body>::Data>>,
+        conn: Connection<H2Io<T>, SendBuf<<B as Body>::Data>>,
     }
 }
 
@@ -222,7 +222,7 @@ where
     B: Body,
     T: Read + Write + Unpin,
 {
-    fn new(ponger: Ponger, conn: Connection<Compat<T>, SendBuf<<B as Body>::Data>>) -> Self {
+    fn new(ponger: Ponger, conn: Connection<H2Io<T>, SendBuf<<B as Body>::Data>>) -> Self {
         Conn { ponger, conn }
     }
 }
@@ -261,7 +261,7 @@ pin_project! {
         T: Unpin,
     {
         #[pin]
-        conn: Either<Conn<T, B>, Connection<Compat<T>, SendBuf<<B as Body>::Data>>>,
+        conn: Either<Conn<T, B>, Connection<H2Io<T>, SendBuf<<B as Body>::Data>>>,
         #[pin]
         is_terminated: bool,
     }

@@ -90,12 +90,28 @@ pin_project! {
     pub struct TokioIo<T> {
         #[pin]
         inner: T,
+        owned: bool,
+        lent_read: Option<bytes::BytesMut>,
+        lent_write: Vec<bytes::Bytes>,
     }
+}
+
+/// With `HYPER_TEST_OWNED_IO` set, `TokioIo` behaves like completion-based
+/// I/O: it needs owned buffers, and keeps them from when an operation is
+/// submitted until a later poll completes it.
+fn owned_io() -> bool {
+    static OWNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OWNED.get_or_init(|| std::env::var_os("HYPER_TEST_OWNED_IO").is_some())
 }
 
 impl<T> TokioIo<T> {
     pub fn new(inner: T) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            owned: owned_io(),
+            lent_read: None,
+            lent_write: Vec::new(),
+        }
     }
 
     pub fn inner(self) -> T {
@@ -124,6 +140,63 @@ where
             buf.advance(n);
         }
         Poll::Ready(Ok(()))
+    }
+
+    fn poll_read_buf(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut bytes::BytesMut,
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let this = self.project();
+        let mut spare = match this.lent_read.take() {
+            Some(spare) => spare,
+            None => {
+                if buf.capacity() == buf.len() {
+                    buf.reserve(64);
+                }
+                let spare = buf.split_off(buf.len());
+                if *this.owned {
+                    // Submitted. Complete on a later poll.
+                    *this.lent_read = Some(spare);
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                spare
+            }
+        };
+        let res = {
+            let mut tbuf = tokio::io::ReadBuf::uninit(spare.spare_capacity_mut());
+            match tokio::io::AsyncRead::poll_read(this.inner, cx, &mut tbuf) {
+                Poll::Ready(res) => res.map(|()| tbuf.filled().len()),
+                Poll::Pending if *this.owned => {
+                    *this.lent_read = Some(spare);
+                    return Poll::Pending;
+                }
+                Poll::Pending => {
+                    buf.unsplit(spare);
+                    return Poll::Pending;
+                }
+            }
+        };
+        let n = match res {
+            Ok(n) => n,
+            Err(e) => {
+                buf.unsplit(spare);
+                return Poll::Ready(Err(e));
+            }
+        };
+        unsafe {
+            spare.set_len(n);
+        }
+        // The read was submitted for another buffer if the IO changed hands
+        // in between. `buf` only gets what fits its spare capacity then.
+        assert!(
+            buf.as_ptr().wrapping_add(buf.len()) == spare.as_ptr()
+                || n <= buf.capacity() - buf.len(),
+            "a read completed with more than the spare capacity of the buffer"
+        );
+        buf.unsplit(spare);
+        Poll::Ready(Ok(n))
     }
 }
 
@@ -160,6 +233,52 @@ where
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<Result<usize, std::io::Error>> {
         tokio::io::AsyncWrite::poll_write_vectored(self.project().inner, cx, bufs)
+    }
+
+    fn needs_owned_buffers(&self) -> bool {
+        self.owned
+    }
+
+    fn poll_write_owned(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[bytes::Bytes],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let this = self.project();
+        if this.lent_write.is_empty() {
+            this.lent_write
+                .extend(bufs.iter().filter(|buf| !buf.is_empty()).cloned());
+            if this.lent_write.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            if *this.owned {
+                // Submitted. Complete on a later poll.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        } else {
+            let same = this
+                .lent_write
+                .iter()
+                .zip(bufs.iter().filter(|buf| !buf.is_empty()))
+                .all(|(a, b)| a.as_ptr() == b.as_ptr() && a.len() == b.len());
+            assert!(same, "other buffers were passed to a write in flight");
+        }
+        let slices: Vec<std::io::IoSlice<'_>> = this
+            .lent_write
+            .iter()
+            .map(|buf| std::io::IoSlice::new(buf))
+            .collect();
+        let res = if tokio::io::AsyncWrite::is_write_vectored(&*this.inner) {
+            tokio::io::AsyncWrite::poll_write_vectored(this.inner, cx, &slices)
+        } else {
+            tokio::io::AsyncWrite::poll_write(this.inner, cx, &slices[0])
+        };
+        if res.is_ready() || !*this.owned {
+            drop(slices);
+            this.lent_write.clear();
+        }
+        res
     }
 }
 

@@ -173,6 +173,14 @@ impl Read for Upgraded {
     ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.io).poll_read(cx, buf)
     }
+
+    fn poll_read_buf(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut bytes::BytesMut,
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.io).poll_read_buf(cx, buf)
+    }
 }
 
 impl Write for Upgraded {
@@ -202,6 +210,18 @@ impl Write for Upgraded {
 
     fn is_write_vectored(&self) -> bool {
         self.io.is_write_vectored()
+    }
+
+    fn needs_owned_buffers(&self) -> bool {
+        self.io.needs_owned_buffers()
+    }
+
+    fn poll_write_owned(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[Bytes],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write_owned(cx, bufs)
     }
 }
 
